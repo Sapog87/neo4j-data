@@ -1,0 +1,110 @@
+LOAD CSV WITH HEADERS FROM 'https://raw.githubusercontent.com/Sapog87/neo4j-data/master/stations.csv' as row FIELDTERMINATOR ','
+WITH row WHERE row.id IS NOT NULL
+create (:Station {station_id: row.id, name: row.name});
+
+LOAD CSV WITH HEADERS FROM 'https://raw.githubusercontent.com/Sapog87/neo4j-data/master/routes.csv' as row FIELDTERMINATOR ','
+WITH row WHERE row.id IS NOT NULL
+create (:Route {roaute_id: row.id, name: row.name});
+
+LOAD CSV WITH HEADERS FROM 'https://raw.githubusercontent.com/Sapog87/neo4j-data/master/stops.csv' as row FIELDTERMINATOR ','
+WITH row WHERE row.id IS NOT NULL and row.arrival_time is not null
+create (s:Stop {stop_id: row.id, name: row.name, arrival_time:localtime(row.arrival_time),station_id:row.station_id,route_id:row.route_id});
+
+LOAD CSV WITH HEADERS FROM 'https://raw.githubusercontent.com/Sapog87/neo4j-data/master/stops.csv' as row FIELDTERMINATOR ','
+WITH row WHERE row.id IS NOT NULL and row.departure_time is not null
+create (s1:Start {start_id: row.id, name: row.name, departure_time:localtime(row.departure_time),station_id:row.station_id,route_id:row.route_id,next_stop_id:row.next_stop_id});
+
+MATCH (stop:Stop), (start:Start) 
+WHERE stop.stop_id = start.next_stop_id
+CREATE (start)-[:Route {
+    duration: CASE 
+                WHEN duration.between(start.departure_time, stop.arrival_time).seconds < 0 
+                THEN 86400 + duration.between(start.departure_time, stop.arrival_time).seconds 
+                ELSE duration.between(start.departure_time, stop.arrival_time).seconds 
+              END
+}]->(stop);
+
+MATCH (stop:Stop), (start:Start) 
+where stop.stop_id = start.start_id
+CREATE (stop)-[:Wait {
+    duration: CASE 
+                WHEN duration.between(stop.arrival_time,start.departure_time).seconds < 0 
+                THEN 86400 + duration.between(stop.arrival_time,start.departure_time).seconds 
+                ELSE duration.between(stop.arrival_time,start.departure_time).seconds 
+              END
+}]->(start);
+
+MATCH (stop:Stop), (start:Start) 
+where stop.station_id = start.station_id and stop.stop_id <> start.start_id
+CREATE (stop)-[:Transfer {
+    duration: CASE 
+                WHEN duration.between(stop.arrival_time,start.departure_time).seconds < 0 
+                THEN 86400 + duration.between(stop.arrival_time,start.departure_time).seconds 
+                ELSE duration.between(stop.arrival_time,start.departure_time).seconds 
+              END
+}]->(start);
+
+match (station:Station), (start:Start)
+where station.station_id = start.station_id
+create (station)-[:On{duration:10000000000}]->(start);
+
+match (station:Station), (stop:Stop)
+where station.station_id = stop.station_id
+create (stop)-[:On{duration:10000000000}]->(station);
+
+
+
+
+
+
+
+CALL gds.graph.project(
+  'myGraph',
+  ['Stop', 'Start', 'Station'],
+  {
+    On: {
+      type: 'On',
+      properties: 'duration'
+    },
+    Transfer: {
+      type: 'Transfer',
+      properties: 'duration'
+    },
+    Wait: {
+      type: 'Wait',
+      properties: 'duration'
+    },
+    Route: {
+      type: 'Route',
+      properties: 'duration'
+    }
+  }
+);
+
+
+
+
+MATCH (source:Station {name: 's1'}), (target:Station {name: 's7'}) 
+CALL gds.shortestPath.yens.stream(
+  'myGraph',
+  {
+    sourceNode: source,
+    targetNode: target,
+    k: 100,
+    relationshipWeightProperty: 'duration',
+    relationshipTypes: ['On', 'Wait', 'Route', 'Transfer']
+  }
+)
+YIELD nodeIds, totalCost, path
+UNWIND [nodeId IN nodeIds | gds.util.asNode(nodeId)] AS node
+WITH path, totalCost, COLLECT(node) AS nodes, nodeIds
+WITH path, totalCost,nodeIds, nodes, 
+     REDUCE(pairs = [], i IN range(0, size(nodes) - 2) | pairs + [[nodes[i], nodes[i + 1]]]) AS nodePairs
+UNWIND nodePairs AS pair
+WITH path, totalCost, pair[0] AS startNode, pair[1] AS endNode, nodes, nodeIds
+Optional MATCH (startNode)-[t:Transfer]->(endNode)
+Optional MATCH (startNode)-[o:On]->(endNode) 
+WITH path, totalCost, COUNT(t) AS transferConnections, nodes, nodeIds, COUNT(o) as dumb
+where transferConnections <=4 and dumb = 2
+RETURN totalCost-20000000000, transferConnections , nodeIds, dumb
+ORDER BY totalCost ASC, transferConnections ASC, totalCost ASC
